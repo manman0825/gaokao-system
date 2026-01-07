@@ -11,11 +11,19 @@ xlsx_source_path = '福建2025年专家版大数据.xlsx'  # 放在项目根目�
 txt_guide_path = '填报指南.txt'  # 放在项目根目录
 
 # ==================== 初始化应用 ====================
+import os
 app = Flask(__name__)
-app.config['INSTANCE_PATH'] = '/tmp'  # ← 新增这行
-app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{db_file_name}'
+
+# 关键：Serverless 环境必须把实例路径指向可写目录，否则 500
+app.instance_path = '/tmp'
+os.makedirs(app.instance_path, exist_ok=True)
+
+# 其它配置
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///:memory:'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key-123')
+
+# 初始化扩展
 db = SQLAlchemy(app)
 
 # ==================== 数据模型 ====================
@@ -537,4 +545,5 @@ if __name__ == '__main__':
     print(f"🚀 服务器启动在 http://localhost: {port}")
     print(f"📁 数据文件路径：{xlsx_source_path}")
     app.run(host='0.0.0.0', port=port, debug=True)
+
 
