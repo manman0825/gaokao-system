@@ -12,6 +12,7 @@ txt_guide_path = '填报指南.txt'  # 放在项目根目录
 
 # ==================== 初始化应用 ====================
 app = Flask(__name__)
+app.config['INSTANCE_PATH'] = '/tmp'  # ← 新增这行
 app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{db_file_name}'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key-123')
@@ -536,3 +537,4 @@ if __name__ == '__main__':
     print(f"🚀 服务器启动在 http://localhost: {port}")
     print(f"📁 数据文件路径：{xlsx_source_path}")
     app.run(host='0.0.0.0', port=port, debug=True)
+
