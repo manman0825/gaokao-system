@@ -3,6 +3,5 @@ pandas==2.1.4
 Flask==2.3.3
 Flask-SQLAlchemy==3.0.5
 openpyxl==3.1.2
-# 新增云托管运行必需的依赖
-gunicorn==21.2.0
-# 若有其他自定义依赖，继续在下方添加
+bcrypt==4.0.1          
+gunicorn==21.2.0       
