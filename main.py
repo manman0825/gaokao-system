@@ -62,6 +62,13 @@ def calc_probability(user_score, min_s, avg_s):
         return 40
     return 10
 
+def set_prob(records, user_score):
+    """给一组记录补算/补写 probability"""
+    for r in records:
+        r.probability = calc_probability(user_score, r.min_score, r.avg_score or r.min_score)
+    db.session.commit()
+    return records
+
 def hash_pwd(pwd):
     return bcrypt.hashpw(pwd.encode(), bcrypt.gensalt()).decode()
 
@@ -193,53 +200,48 @@ def logout():
     session.clear()
     return redirect('/')
 
-# ---------- 查询（已支持组合过滤） ----------
+# ---------- 查询（已支持 GET/POST 组合过滤） ----------
 @app.route('/query', methods=['GET', 'POST'])
 def query():
-    if request.method == 'POST':
-        user_score = int(request.form.get('score', 0))
-        college    = request.form.get('college', '').strip()
-        major      = request.form.get('major', '').strip()
-        category   = request.form.get('category', '').strip()
+    # 统一取参数，POST 优先，GET 兜底
+    user_score = int((request.form if request.method=='POST' else request.args).get('score', 0))
+    college    = (request.form if request.method=='POST' else request.args).get('college', '').strip()
+    major      = (request.form if request.method=='POST' else request.args).get('major', '').strip()
+    category   = (request.form if request.method=='POST' else request.args).get('category', '').strip()
+    requirement= (request.form if request.method=='POST' else request.args).get('requirement', '').strip()
 
-        q = AdmissionRecord.query
-        if college:   q = q.filter(AdmissionRecord.college_name.contains(college))
-        if major:     q = q.filter(AdmissionRecord.major_name.contains(major))
-        if category:  q = q.filter(AdmissionRecord.category == category)
-        records = q.all()
+    q = AdmissionRecord.query
+    if college:     q = q.filter(AdmissionRecord.college_name.contains(college))
+    if major:       q = q.filter(AdmissionRecord.major_name.contains(major))
+    if category:    q = q.filter(AdmissionRecord.category == category)
+    if requirement: q = q.filter(AdmissionRecord.requirement.contains(requirement))
 
-        # 计算概率并缓存
-        for r in records:
-            r.probability = calc_probability(user_score, r.min_score, r.avg_score or r.min_score)
-        db.session.commit()
+    records = q.all()
+    if user_score:               # 有分数才算概率
+        records = set_prob(records, user_score)
 
-        return bs_html(f'''
-<h4>查询结果</h4>
-<a class="btn btn-success mb-3" href="/analysis?score={user_score}&college={college}&major={major}&category={category}">查看智能分析报告</a>
-<table class="table table-bordered table-sm">
-  <thead class="table-light"><tr>
-    <th>院校</th><th>专业</th><th>科类</th><th>最低分</th><th>平均分</th><th>录取概率</th>
-  </tr></thead>
-  <tbody>''' + '\n'.join(f'''
-    <tr>
-      <td>{r.college_name}</td><td>{r.major_name}</td><td>{r.category}</td>
-      <td>{r.min_score or ''}</td><td>{r.avg_score or ''}</td>
-      <td><span class="badge {"bg-success" if r.probability>80 else "bg-warning" if r.probability>40 else "bg-danger"}">{r.probability}%</span></td>
-    </tr>''' for r in records) + '''
-  </tbody></table>''')
+    # 生成表格
+    tbl = '\n'.join(f'''
+        <tr>
+          <td><a href="/college/{r.college_name}">{r.college_name}</a></td>
+          <td><a href="/major/{r.major_name}">{r.major_name}</a></td>
+          <td>{r.category}</td><td>{r.min_score or ''}</td><td>{r.avg_score or ''}</td>
+          <td><span class="badge {"bg-success" if r.probability>80 else "bg-warning" if r.probability>40 else "bg-danger"}">{r.probability}%</span></td>
+        </tr>''' for r in records)
 
-    return bs_html('''
+    # 返回页面（GET/POST 同模板）
+    return bs_html(f'''
 <h4>志愿查询</h4>
-<form method="post">
-  <div class="row g-3">
-    <div class="col-md-2"><label>高考分数</label><input type="number" class="form-control" name="score" required></div>
-    <div class="col-md-3"><label>院校名称</label><input class="form-control" name="college" placeholder="可选"></div>
-    <div class="col-md-3"><label>专业名称</label><input class="form-control" name="major" placeholder="可选"></div>
-    <div class="col-md-2"><label>科类</label>
-      <select class="form-select" name="category"><option value="">全部</option><option>物理类</option><option>历史类</option></select></div>
-    <div class="col-md-2 align-self-end"><button class="btn btn-primary">查询</button></div>
-  </div>
-</form>''')
+<form method="get" class="row g-3 mb-3">   <!-- 改用 GET，方便分享 -->
+  <div class="col-md-2"><label>高考分数</label><input type="number" class="form-control" name="score" value="{user_score or ''}"></div>
+  <div class="col-md-2"><label>院校名称</label><input class="form-control" name="college" value="{college}"></div>
+  <div class="col-md-2"><label>专业名称</label><input class="form-control" name="major" value="{major}"></div>
+  <div class="col-md-2"><label>科类</label>
+      <select class="form-select" name="category"><option value="">全部</option><option{" selected" if category=="物理类" else ""}>物理类</option><option{" selected" if category=="历史类" else ""}>历史类</option></select></div>
+  <div class="col-md-2"><label>选科要求</label><input class="form-control" name="requirement" value="{requirement}" placeholder="如 化"></div>
+  <div class="col-md-2 align-self-end"><button class="btn btn-primary">查询</button></div>
+</form>
+{('<table class="table table-bordered table-sm"><thead class="table-light"><tr><th>院校</th><th>专业</th><th>科类</th><th>最低分</th><th>平均分</th><th>录取概率</th></tr></thead><tbody>' + tbl + '</tbody></table>') if records else '<div class="alert alert-info">暂无数据，请调整条件</div>'}''')
 
 # ---------- 智能分析报告 ----------
 @app.route('/analysis')
@@ -320,7 +322,7 @@ def colleges():
 <table class="table table-bordered table-sm">
   <thead class="table-light"><tr><th>院校名称</th><th>院校代码</th><th>所在城市</th><th>招生专业数</th></tr></thead>
   <tbody>''' + '\n'.join(f'''<tr>
-      <td><a href="/query?college={r.college_name}">{r.college_name}</a></td>
+      <td><a href="/college/{r.college_name}">{r.college_name}</a></td>
       <td>{r.college_code or ''}</td><td>{r.city or ''}</td><td>{r.cnt}</td>
     </tr>''' for r in rows) + '''
 </tbody></table>''')
@@ -345,10 +347,61 @@ def majors():
 <table class="table table-bordered table-sm">
   <thead class="table-light"><tr><th>专业名称</th><th>专业代码</th><th>开设院校数</th></tr></thead>
   <tbody>''' + '\n'.join(f'''<tr>
-      <td><a href="/query?major={r.major_name}">{r.major_name}</a></td>
+      <td><a href="/major/{r.major_name}">{r.major_name}</a></td>
       <td>{r.major_code or ''}</td><td>{r.cnt}</td>
     </tr>''' for r in rows) + '''
 </tbody></table>''')
+
+# ---------- 院校详情页 ----------
+@app.route('/college/<path:name>')
+def college_detail(name):
+    c = AdmissionRecord.query.filter_by(college_name=name).first_or_404()
+    # 把同一个学校的所有专业拉出来
+    majors = AdmissionRecord.query.filter_by(college_name=name).all()
+    return bs_html(f'''
+<h4>{name} 介绍</h4>
+<div class="card mb-4">
+  <div class="card-body">
+    <h5>基本信息</h5>
+    <p><strong>院校代码：</strong>{c.college_code or ''}</p>
+    <p><strong>所在城市：</strong>{c.city or ''}</p>
+    <p><strong>院校标签：</strong>{c.college_info or ''}</p>
+  </div>
+</div>
+<h5>招生专业（{len(majors)} 个）</h5>
+<table class="table table-bordered table-sm">
+  <thead class="table-light"><tr><th>专业</th><th>科类</th><th>选科</th><th>最低分</th><th>平均分</th></tr></thead>
+  <tbody>''' + '\n'.join(f'''<tr>
+      <td><a href="/major/{m.major_name}">{m.major_name}</a></td><td>{m.category}</td><td>{m.requirement}</td>
+      <td>{m.min_score or ''}</td><td>{m.avg_score or ''}</td>
+    </tr>''' for m in majors) + '''
+</tbody></table>
+<a class="btn btn-secondary" href="/colleges">返回院校库</a>''')
+
+# ---------- 专业详情页 ----------
+@app.route('/major/<path:name>')
+def major_detail(name):
+    m = AdmissionRecord.query.filter_by(major_name=name).first_or_404()
+    # 把开这个专业的所有学校拉出来
+    schools = AdmissionRecord.query.filter_by(major_name=name).all()
+    return bs_html(f'''
+<h4>{name} 介绍</h4>
+<div class="card mb-4">
+  <div class="card-body">
+    <h5>基本信息</h5>
+    <p><strong>专业代码：</strong>{m.major_code or ''}</p>
+    <p><strong>专业简介：</strong>{m.major_info or ''}</p>
+  </div>
+</div>
+<h5>开设院校（{len(schools)} 所）</h5>
+<table class="table table-bordered table-sm">
+  <thead class="table-light"><tr><th>院校</th><th>科类</th><th>选科</th><th>最低分</th><th>平均分</th></tr></thead>
+  <tbody>''' + '\n'.join(f'''<tr>
+      <td><a href="/college/{s.college_name}">{s.college_name}</a></td><td>{s.category}</td><td>{s.requirement}</td>
+      <td>{s.min_score or ''}</td><td>{s.avg_score or ''}</td>
+    </tr>''' for s in schools) + '''
+</tbody></table>
+<a class="btn btn-secondary" href="/majors">返回专业库</a>''')
 
 # ==================== 7. 管理员后台（完整） ====================
 @app.route('/admin/login', methods=['GET', 'POST'])
@@ -601,167 +654,3 @@ def admin_data_del(rid):
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
-
-
-# ==================== 补丁开始 ====================
-
-# ---------- 0. 通用：把概率计算抽到单独函数，任何地方都能复用 ----------
-def set_prob(records, user_score):
-    """给一组记录补算/补写 probability"""
-    for r in records:
-        r.probability = calc_probability(user_score, r.min_score, r.avg_score or r.min_score)
-    db.session.commit()          # 一次性写回，避免每次查都重算
-    return records
-
-
-# ---------- 1. 修复 /query 路由：支持 GET 方式“分数+选科”组合 ----------
-@app.route('/query', methods=['GET', 'POST'])
-def query():
-    # 统一取参数，POST 优先，GET 兜底
-    user_score = int((request.form if request.method=='POST' else request.args).get('score', 0))
-    college    = (request.form if request.method=='POST' else request.args).get('college', '').strip()
-    major      = (request.form if request.method=='POST' else request.args).get('major', '').strip()
-    category   = (request.form if request.method=='POST' else request.args).get('category', '').strip()
-    requirement= (request.form if request.method=='POST' else request.args).get('requirement', '').strip()
-
-    q = AdmissionRecord.query
-    if college:     q = q.filter(AdmissionRecord.college_name.contains(college))
-    if major:       q = q.filter(AdmissionRecord.major_name.contains(major))
-    if category:    q = q.filter(AdmissionRecord.category == category)
-    if requirement: q = q.filter(AdmissionRecord.requirement.contains(requirement))
-
-    records = q.all()
-    if user_score:               # 有分数才算概率
-        records = set_prob(records, user_score)
-
-    # 生成表格
-    tbl = '\n'.join(f'''
-        <tr>
-          <td><a href="/college/{r.college_name}">{r.college_name}</a></td>
-          <td><a href="/major/{r.major_name}">{r.major_name}</a></td>
-          <td>{r.category}</td><td>{r.min_score or ''}</td><td>{r.avg_score or ''}</td>
-          <td><span class="badge {"bg-success" if r.probability>80 else "bg-warning" if r.probability>40 else "bg-danger"}">{r.probability}%</span></td>
-        </tr>''' for r in records)
-
-    # 返回页面（GET/POST 同模板）
-    return bs_html(f'''
-<h4>志愿查询</h4>
-<form method="get" class="row g-3 mb-3">   <!-- 改用 GET，方便分享 -->
-  <div class="col-md-2"><label>高考分数</label><input type="number" class="form-control" name="score" value="{user_score or ''}"></div>
-  <div class="col-md-2"><label>院校名称</label><input class="form-control" name="college" value="{college}"></div>
-  <div class="col-md-2"><label>专业名称</label><input class="form-control" name="major" value="{major}"></div>
-  <div class="col-md-2"><label>科类</label>
-      <select class="form-select" name="category"><option value="">全部</option><option{" selected" if category=="物理类" else ""}>物理类</option><option{" selected" if category=="历史类" else ""}>历史类</option></select></div>
-  <div class="col-md-2"><label>选科要求</label><input class="form-control" name="requirement" value="{requirement}" placeholder="如 化"></div>
-  <div class="col-md-2 align-self-end"><button class="btn btn-primary">查询</button></div>
-</form>
-{('<table class="table table-bordered table-sm"><thead class="table-light"><tr><th>院校</th><th>专业</th><th>科类</th><th>最低分</th><th>平均分</th><th>录取概率</th></tr></thead><tbody>' + tbl + '</tbody></table>') if records else '<div class="alert alert-info">暂无数据，请调整条件</div>'}''')
-
-
-# ---------- 2. 院校详情页 ----------
-@app.route('/college/<path:name>')
-def college_detail(name):
-    c = AdmissionRecord.query.filter_by(college_name=name).first_or_404()
-    # 把同一个学校的所有专业拉出来
-    majors = AdmissionRecord.query.filter_by(college_name=name).all()
-    return bs_html(f'''
-<h4>{name} 介绍</h4>
-<div class="card mb-4">
-  <div class="card-body">
-    <h5>基本信息</h5>
-    <p><strong>院校代码：</strong>{c.college_code or ''}</p>
-    <p><strong>所在城市：</strong>{c.city or ''}</p>
-    <p><strong>院校标签：</strong>{c.college_info or ''}</p>
-  </div>
-</div>
-<h5>招生专业（{len(majors)} 个）</h5>
-<table class="table table-bordered table-sm">
-  <thead class="table-light"><tr><th>专业</th><th>科类</th><th>选科</th><th>最低分</th><th>平均分</th></tr></thead>
-  <tbody>''' + '\n'.join(f'''<tr>
-      <td><a href="/major/{m.major_name}">{m.major_name}</a></td><td>{m.category}</td><td>{m.requirement}</td>
-      <td>{m.min_score or ''}</td><td>{m.avg_score or ''}</td>
-    </tr>''' for m in majors) + '''
-</tbody></table>
-<a class="btn btn-secondary" href="/colleges">返回院校库</a>''')
-
-
-# ---------- 3. 专业详情页 ----------
-@app.route('/major/<path:name>')
-def major_detail(name):
-    m = AdmissionRecord.query.filter_by(major_name=name).first_or_404()
-    # 把开这个专业的所有学校拉出来
-    schools = AdmissionRecord.query.filter_by(major_name=name).all()
-    return bs_html(f'''
-<h4>{name} 介绍</h4>
-<div class="card mb-4">
-  <div class="card-body">
-    <h5>基本信息</h5>
-    <p><strong>专业代码：</strong>{m.major_code or ''}</p>
-    <p><strong>专业简介：</strong>{m.major_info or ''}</p>
-  </div>
-</div>
-<h5>开设院校（{len(schools)} 所）</h5>
-<table class="table table-bordered table-sm">
-  <thead class="table-light"><tr><th>院校</th><th>科类</th><th>选科</th><th>最低分</th><th>平均分</th></tr></thead>
-  <tbody>''' + '\n'.join(f'''<tr>
-      <td><a href="/college/{s.college_name}">{s.college_name}</a></td><td>{s.category}</td><td>{s.requirement}</td>
-      <td>{s.min_score or ''}</td><td>{s.avg_score or ''}</td>
-    </tr>''' for s in schools) + '''
-</tbody></table>
-<a class="btn btn-secondary" href="/majors">返回专业库</a>''')
-
-
-# ---------- 4. 把院校库 / 专业库列表页链接改到详情 ----------
-@app.route('/colleges')
-def colleges():
-    kw = request.args.get('search', '').strip()
-    q = db.session.query(AdmissionRecord.college_name,
-                         AdmissionRecord.college_code,
-                         AdmissionRecord.city,
-                         db.func.count(AdmissionRecord.id).label('cnt'))\
-                  .group_by(AdmissionRecord.college_name)
-    if kw:
-        q = q.filter(AdmissionRecord.college_name.contains(kw))
-    rows = q.all()
-    return bs_html(f'''
-<h4>院校库</h4>
-<form class="row g-2 mb-3">
-  <div class="col-auto"><input class="form-control" name="search" placeholder="院校名称" value="{kw}"></div>
-  <div class="col-auto"><button class="btn btn-primary">搜索</button></div>
-</form>
-<table class="table table-bordered table-sm">
-  <thead class="table-light"><tr><th>院校名称</th><th>院校代码</th><th>所在城市</th><th>招生专业数</th></tr></thead>
-  <tbody>''' + '\n'.join(f'''<tr>
-      <td><a href="/college/{r.college_name}">{r.college_name}</a></td>
-      <td>{r.college_code or ''}</td><td>{r.city or ''}</td><td>{r.cnt}</td>
-    </tr>''' for r in rows) + '''
-</tbody></table>''')
-
-
-@app.route('/majors')
-def majors():
-    kw = request.args.get('search', '').strip()
-    q = db.session.query(AdmissionRecord.major_name,
-                         AdmissionRecord.major_code,
-                         db.func.count(AdmissionRecord.id).label('cnt'))\
-                  .group_by(AdmissionRecord.major_name)
-    if kw:
-        q = q.filter(AdmissionRecord.major_name.contains(kw))
-    rows = q.all()
-    return bs_html(f'''
-<h4>专业库</h4>
-<form class="row g-2 mb-3">
-  <div class="col-auto"><input class="form-control" name="search" placeholder="专业名称" value="{kw}"></div>
-  <div class="col-auto"><button class="btn btn-primary">搜索</button></div>
-</form>
-<table class="table table-bordered table-sm">
-  <thead class="table-light"><tr><th>专业名称</th><th>专业代码</th><th>开设院校数</th></tr></thead>
-  <tbody>''' + '\n'.join(f'''<tr>
-      <td><a href="/major/{r.major_name}">{r.major_name}</a></td>
-      <td>{r.major_code or ''}</td><td>{r.cnt}</td>
-    </tr>''' for r in rows) + '''
-</tbody></table>''')
-
-
-# ==================== 补丁结束 ====================
-
