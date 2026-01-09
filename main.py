@@ -1,14 +1,17 @@
 # ==================== 1. 依赖 ====================
 import os
 import math
+import re
 import bcrypt
-from flask import Flask, request, redirect, session, jsonify
+import pandas as pd
+from flask import Flask, request, redirect, session, jsonify, url_for
 from flask_sqlalchemy import SQLAlchemy
 
 # ==================== 2. 基础配置 ====================
 DB_FILE = '/tmp/gaokao.db'
 XLSX    = '福建2025年专家版大数据.xlsx'
 TXT     = '填报指南.txt'
+TIP_FILE= '志愿技巧.txt'          # 新增技巧文件
 
 app = Flask(__name__)
 app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{DB_FILE}'
@@ -76,7 +79,6 @@ def create_app():
             db.session.commit()
         # 空库自动导 Excel
         if AdmissionRecord.query.count() == 0 and os.path.exists(XLSX):
-            import pandas as pd
             df = pd.read_excel(XLSX, header=2, engine='openpyxl')
             for _, row in df.iterrows():
                 if pd.isna(row.get('院校名称')): continue
@@ -129,6 +131,9 @@ def bs_html(content):
       {% else %}
         <a class="btn btn-sm btn-outline-light" href="/login">登录</a>
       {% endif %}
+      <a class="btn btn-sm btn-outline-light ms-2" href="/colleges">院校库</a>
+      <a class="btn btn-sm btn-outline-light ms-2" href="/majors">专业库</a>
+      <a class="btn btn-sm btn-outline-light ms-2" href="/skill">填报技巧</a>
     </div>
   </div>
 </nav>
@@ -188,24 +193,29 @@ def logout():
     session.clear()
     return redirect('/')
 
-# ---------- 查询 ----------
+# ---------- 查询（已支持组合过滤） ----------
 @app.route('/query', methods=['GET', 'POST'])
 def query():
     if request.method == 'POST':
         user_score = int(request.form.get('score', 0))
         college    = request.form.get('college', '').strip()
+        major      = request.form.get('major', '').strip()
         category   = request.form.get('category', '').strip()
+
         q = AdmissionRecord.query
         if college:   q = q.filter(AdmissionRecord.college_name.contains(college))
+        if major:     q = q.filter(AdmissionRecord.major_name.contains(major))
         if category:  q = q.filter(AdmissionRecord.category == category)
         records = q.all()
+
         # 计算概率并缓存
         for r in records:
             r.probability = calc_probability(user_score, r.min_score, r.avg_score or r.min_score)
         db.session.commit()
+
         return bs_html(f'''
 <h4>查询结果</h4>
-<a class="btn btn-success mb-3" href="/analysis?score={user_score}&college={college}&category={category}">查看智能分析报告</a>
+<a class="btn btn-success mb-3" href="/analysis?score={user_score}&college={college}&major={major}&category={category}">查看智能分析报告</a>
 <table class="table table-bordered table-sm">
   <thead class="table-light"><tr>
     <th>院校</th><th>专业</th><th>科类</th><th>最低分</th><th>平均分</th><th>录取概率</th>
@@ -222,11 +232,12 @@ def query():
 <h4>志愿查询</h4>
 <form method="post">
   <div class="row g-3">
-    <div class="col-md-3"><label>高考分数</label><input type="number" class="form-control" name="score" required></div>
+    <div class="col-md-2"><label>高考分数</label><input type="number" class="form-control" name="score" required></div>
     <div class="col-md-3"><label>院校名称</label><input class="form-control" name="college" placeholder="可选"></div>
-    <div class="col-md-3"><label>科类</label>
+    <div class="col-md-3"><label>专业名称</label><input class="form-control" name="major" placeholder="可选"></div>
+    <div class="col-md-2"><label>科类</label>
       <select class="form-select" name="category"><option value="">全部</option><option>物理类</option><option>历史类</option></select></div>
-    <div class="col-md-3 align-self-end"><button class="btn btn-primary">查询</button></div>
+    <div class="col-md-2 align-self-end"><button class="btn btn-primary">查询</button></div>
   </div>
 </form>''')
 
@@ -235,9 +246,11 @@ def query():
 def analysis():
     score   = int(request.args.get('score', 0))
     college = request.args.get('college', '')
+    major   = request.args.get('major', '')
     category= request.args.get('category', '')
     q = AdmissionRecord.query
     if college:  q = q.filter(AdmissionRecord.college_name.contains(college))
+    if major:    q = q.filter(AdmissionRecord.major_name.contains(major))
     if category: q = q.filter(AdmissionRecord.category == category)
     records = q.all()
     # 概率区间 ±25
@@ -277,7 +290,67 @@ def guide():
         txt = f.read().replace('\n', '<br>')
     return bs_html(f'<h4>填报指南</h4><div class="border p-3">{txt}</div><a class="btn btn-secondary mt-3" href="/query">返回</a>')
 
-# ---------- 管理员后台 ----------
+# ---------- 志愿填报技巧 ----------
+@app.route('/skill')
+def skill():
+    if not os.path.exists(TIP_FILE):
+        return bs_html('<div class="alert alert-warning">暂无志愿技巧</div>')
+    with open(TIP_FILE, encoding='utf-8') as f:
+        txt = f.read().replace('\n', '<br>')
+    return bs_html(f'<h4>志愿填报技巧</h4><div class="border p-3">{txt}</div><a class="btn btn-secondary mt-3" href="/query">返回</a>')
+
+# ---------- 院校库 ----------
+@app.route('/colleges')
+def colleges():
+    kw = request.args.get('search', '').strip()
+    q = db.session.query(AdmissionRecord.college_name,
+                         AdmissionRecord.college_code,
+                         AdmissionRecord.city,
+                         db.func.count(AdmissionRecord.id).label('cnt'))\
+                  .group_by(AdmissionRecord.college_name)
+    if kw:
+        q = q.filter(AdmissionRecord.college_name.contains(kw))
+    rows = q.all()
+    return bs_html(f'''
+<h4>院校库</h4>
+<form class="row g-2 mb-3">
+  <div class="col-auto"><input class="form-control" name="search" placeholder="院校名称" value="{kw}"></div>
+  <div class="col-auto"><button class="btn btn-primary">搜索</button></div>
+</form>
+<table class="table table-bordered table-sm">
+  <thead class="table-light"><tr><th>院校名称</th><th>院校代码</th><th>所在城市</th><th>招生专业数</th></tr></thead>
+  <tbody>''' + '\n'.join(f'''<tr>
+      <td><a href="/query?college={r.college_name}">{r.college_name}</a></td>
+      <td>{r.college_code or ''}</td><td>{r.city or ''}</td><td>{r.cnt}</td>
+    </tr>''' for r in rows) + '''
+</tbody></table>''')
+
+# ---------- 专业库 ----------
+@app.route('/majors')
+def majors():
+    kw = request.args.get('search', '').strip()
+    q = db.session.query(AdmissionRecord.major_name,
+                         AdmissionRecord.major_code,
+                         db.func.count(AdmissionRecord.id).label('cnt'))\
+                  .group_by(AdmissionRecord.major_name)
+    if kw:
+        q = q.filter(AdmissionRecord.major_name.contains(kw))
+    rows = q.all()
+    return bs_html(f'''
+<h4>专业库</h4>
+<form class="row g-2 mb-3">
+  <div class="col-auto"><input class="form-control" name="search" placeholder="专业名称" value="{kw}"></div>
+  <div class="col-auto"><button class="btn btn-primary">搜索</button></div>
+</form>
+<table class="table table-bordered table-sm">
+  <thead class="table-light"><tr><th>专业名称</th><th>专业代码</th><th>开设院校数</th></tr></thead>
+  <tbody>''' + '\n'.join(f'''<tr>
+      <td><a href="/query?major={r.major_name}">{r.major_name}</a></td>
+      <td>{r.major_code or ''}</td><td>{r.cnt}</td>
+    </tr>''' for r in rows) + '''
+</tbody></table>''')
+
+# ==================== 7. 管理员后台（完整） ====================
 @app.route('/admin/login', methods=['GET', 'POST'])
 def admin_login():
     if request.method == 'POST':
@@ -398,10 +471,11 @@ def admin_data():
     if session.get('role') != 'admin':
         return redirect('/admin/login')
     keyword = request.args.get('search', '')
+    page = int(request.args.get('page', 1))
     q = AdmissionRecord.query
     if keyword:
         q = q.filter(AdmissionRecord.college_name.contains(keyword))
-    records = q.paginate(per_page=20, error_out=False)
+    records = q.paginate(page=page, per_page=20, error_out=False)
     return bs_html(f'''
 <h4>录取数据管理</h4>
 <form class="row g-2 mb-3">
@@ -423,8 +497,12 @@ def admin_data():
     </tr>''' for r in records.items) + f'''
 </tbody></table>
 <nav><ul class="pagination">
-  <li class="page-item {"disabled" if not records.has_prev else ""}"><a class="page-link" href="{url_for("admin_data", search=keyword, page=records.prev_num) if records.has_prev else "#"}">上一页</a></li>
-  <li class="page-item {"disabled" if not records.has_next else ""}"><a class="page-link" href="{url_for("admin_data", search=keyword, page=records.next_num) if records.has_next else "#"}">下一页</a></li>
+  <li class="page-item {"disabled" if not records.has_prev else ""}">
+    <a class="page-link" href="{url_for('admin_data', search=keyword, page=records.prev_num) if records.has_prev else "#"}">上一页</a>
+  </li>
+  <li class="page-item {"disabled" if not records.has_next else ""}">
+    <a class="page-link" href="{url_for('admin_data', search=keyword, page=records.next_num) if records.has_next else "#"}">下一页</a>
+  </li>
 </ul></nav>''')
 
 @app.route('/admin/data/add', methods=['GET', 'POST'])
@@ -519,7 +597,7 @@ def admin_data_del(rid):
     db.session.commit()
     return redirect('/admin/data')
 
-# ==================== 7. 启动（仅本地） ====================
+# ==================== 8. 启动（仅本地） ====================
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
