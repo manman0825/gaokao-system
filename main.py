@@ -63,9 +63,14 @@ def calc_probability(user_score, min_s, avg_s):
     return 10
 
 def set_prob(records, user_score):
-    """给一组记录补算/补写 probability"""
+    """给一组记录补算/补写 probability，永不出现 None"""
     for r in records:
-        r.probability = calc_probability(user_score, r.min_score, r.avg_score or r.min_score)
+        # 如果拿不到有效分数，直接给 0，避免 None
+        r.probability = calc_probability(
+            user_score,
+            r.min_score or 0,
+            r.avg_score or r.min_score or 0
+        )
     db.session.commit()
     return records
 
@@ -226,7 +231,7 @@ def query():
           <td><a href="/college/{r.college_name}">{r.college_name}</a></td>
           <td><a href="/major/{r.major_name}">{r.major_name}</a></td>
           <td>{r.category}</td><td>{r.min_score or ''}</td><td>{r.avg_score or ''}</td>
-          <td><span class="badge {"bg-success" if r.probability>80 else "bg-warning" if r.probability>40 else "bg-danger"}">{r.probability}%</span></td>
+          <td><span class="badge {"bg-success" if (r.probability or 0)>80 else "bg-warning" if (r.probability or 0)>40 else "bg-danger"}">{r.probability}%</span></td>
         </tr>''' for r in records)
 
     # 返回页面（GET/POST 同模板）
@@ -654,3 +659,4 @@ def admin_data_del(rid):
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
+
