@@ -1,549 +1,525 @@
+# ==================== 1. 依赖 ====================
 import os
-import pandas as pd
-from flask import Flask, render_template_string, request, redirect, url_for, session
+import math
+import bcrypt
+from flask import Flask, request, redirect, session, jsonify
 from flask_sqlalchemy import SQLAlchemy
-import traceback
 
-# ==================== 配置部分 ====================
-# 使用相对路径（项目根目录下的文件）
-db_file_name = 'gaokao_v7.db'
-xlsx_source_path = '福建2025年专家版大数据.xlsx'  # 放在项目根目录
-txt_guide_path = '填报指南.txt'  # 放在项目根目录
+# ==================== 2. 基础配置 ====================
+DB_FILE = '/tmp/gaokao.db'
+XLSX    = '福建2025年专家版大数据.xlsx'
+TXT     = '填报指南.txt'
 
-# ==================== 初始化应用 ====================
-import os
 app = Flask(__name__)
-
-# 关键：Serverless 环境必须把实例路径指向可写目录，否则 500
-app.instance_path = '/tmp'
-os.makedirs(app.instance_path, exist_ok=True)
-
-# 其它配置
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///:memory:'
+app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{DB_FILE}'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key-123')
-
-# 初始化扩展
+app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev-key-123')
 db = SQLAlchemy(app)
 
-# ==================== 数据模型 ====================
+# ==================== 3. 数据模型（完全对齐文档）=======
 class User(db.Model):
     __tablename__ = 'users'
-    id = db.Column(db.Integer, primary_key=True)
+    id       = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(80), unique=True, nullable=False)
-    password = db.Column(db.String(120), nullable=False)
-    role = db.Column(db.String(20), default='user')  # 'user' 或 'admin'
+    password = db.Column(db.String(120), nullable=False)   # 已存 bcrypt 密文
+    role     = db.Column(db.String(20), default='user')   # user/admin
 
 class AdmissionRecord(db.Model):
     __tablename__ = 'admission_records'
-    id = db.Column(db.Integer, primary_key=True)
-    year = db.Column(db.String(10))
-    batch = db.Column(db.String(50))
-    category = db.Column(db.String(50))
-    college_name = db.Column(db.String(200))
-    college_code = db.Column(db.String(50))
-    college_info = db.Column(db.Text)
-    major_info = db.Column(db.Text)
-    major_name = db.Column(db.String(200))
-    major_code = db.Column(db.String(50))
-    min_score = db.Column(db.Integer)
-    tuition = db.Column(db.String(100))
-    city = db.Column(db.String(100))
+    id          = db.Column(db.Integer, primary_key=True)
+    year        = db.Column(db.String(10))
+    batch       = db.Column(db.String(50))
+    category    = db.Column(db.String(50))   # 物理类/历史类
+    requirement = db.Column(db.String(100))  # 选科要求
+    college_name= db.Column(db.String(100), index=True)
+    college_code= db.Column(db.String(20))
+    college_info= db.Column(db.Text)
+    major_name  = db.Column(db.String(100), index=True)
+    major_code  = db.Column(db.String(20))
+    major_info  = db.Column(db.Text)
+    min_score   = db.Column(db.Integer)
+    min_rank    = db.Column(db.Integer)
+    avg_score   = db.Column(db.Integer)
+    max_score   = db.Column(db.Integer)
+    tuition     = db.Column(db.String(50))
+    city        = db.Column(db.String(50))
+    probability = db.Column(db.Integer)      # 录取概率（0-100），后台计算
 
-# ==================== 辅助函数 ====================
-def build_college_info(row):
-    """构建院校信息字符串"""
-    parts = []
-    if '院校基础信息' in row and pd.notna(row['院校基础信息']):
-        parts.append(f"🏫 {row['院校基础信息']}")
-    if '硕博信息' in row and pd.notna(row['硕博信息']):
-        parts.append(f"🎓 {row['硕博信息']}")
-    return " | ".join(parts) if parts else "暂无院校信息"
-
-def build_major_info(row):
-    """构建专业信息字符串"""
-    parts = []
-    if '专业基础信息' in row and pd.notna(row['专业基础信息']):
-        parts.append(f"📚 {row['专业基础信息']}")
-    if '硕博信息' in row and pd.notna(row['硕博信息']):
-        # 提取硕博信息中的学位点
-        degree_list = []
-        if '硕士' in str(row['硕博信息']):
-            degree_list.append("硕士")
-        if '博士' in str(row['硕博信息']):
-            degree_list.append("博士")
-        if degree_list:
-            parts.append(f"🎓学位点：{' + '.join(degree_list)}")
-    return " | ".join(parts) if parts else "暂无专业信息"
-
-# ==================== 数据导入函数 ====================
-def auto_import_data():
-    """自动导入Excel数据到数据库"""
-    print(f"📂 检查Excel文件: {xlsx_source_path}")
-    
-    if not os.path.exists(xlsx_source_path):
-        print("❌ Excel文件未找到")
+# ==================== 4. 工具函数 ====================
+def calc_probability(user_score, min_s, avg_s):
+    """简单概率模型：文档要求±25分+三段颜色"""
+    if not min_s or not avg_s:
         return 0
-    
-    print("📥 正在读取并导入数据...")
-    try:
-        # 读取Excel文件
-        df = pd.read_excel(xlsx_source_path, header=2, engine='openpyxl')
-        count = 0
-        
-        with app.app_context():
-            # 创建数据库表
-            db.create_all()
-            
-            # 清空现有数据（可选）
-            # AdmissionRecord.query.delete()
-            # db.session.commit()
-            
-            # 导入数据
-            for index, row in df.iterrows():
-                try:
-                    # 检查必要字段
-                    if '院校名称' not in row or pd.isna(row['院校名称']):
-                        continue
-                    
-                    # 构建信息字符串
-                    c_info_str = build_college_info(row)
-                    m_info_str = build_major_info(row)
-                    
-                    # 处理最低分
-                    min_score_val = None
-                    if '最低分1' in row and pd.notna(row['最低分1']):
-                        try:
-                            min_score_val = int(row['最低分1'])
-                        except:
-                            pass
-                    
-                    # 创建记录
-                    record = AdmissionRecord(
-                        year=str(row.get('年份', '2025')),
-                        batch=str(row.get('批次', '')),
-                        category=str(row.get('科类', '')),
-                        college_name=str(row['院校名称']),
-                        college_code=str(row.get('院校代码', '')),
-                        college_info=c_info_str,
-                        major_info=m_info_str,
-                        major_name=str(row.get('专业名称', '')),
-                        major_code=str(row.get('专业代码', '')),
-                        min_score=min_score_val,
-                        tuition=str(row.get('学费', '')),
-                        city=str(row.get('城市', ''))
-                    )
-                    
-                    db.session.add(record)
-                    count += 1
-                    
-                    # 每100条提交一次
-                    if count % 100 == 0:
-                        db.session.commit()
-                        
-                except Exception as e:
-                    print(f"❌ 第{index}行导入失败: {e}")
-                    continue
-            
-            # 提交剩余记录
+    gap = user_score - avg_s
+    if gap >= 25:
+        return 95
+    if gap >= 0:
+        return 70
+    if gap >= -25:
+        return 40
+    return 10
+
+def hash_pwd(pwd):
+    return bcrypt.hashpw(pwd.encode(), bcrypt.gensalt()).decode()
+
+def check_pwd(pwd, hashed):
+    return bcrypt.checkpw(pwd.encode(), hashed.encode())
+
+# ==================== 5. 应用初始化（gunicorn 安全）=======
+def create_app():
+    with app.app_context():
+        db.create_all()
+        # 默认账号
+        if User.query.count() == 0:
+            db.session.add(User(username='admin', password=hash_pwd('123456'), role='admin'))
+            db.session.add(User(username='user',  password=hash_pwd('123456'), role='user'))
             db.session.commit()
-            print(f"✅ 成功导入 {count} 条记录")
-            return count
-            
-    except Exception as e:
-        print(f"❌ 数据导入失败: {e}")
-        traceback.print_exc()
-        return 0
+        # 空库自动导 Excel
+        if AdmissionRecord.query.count() == 0 and os.path.exists(XLSX):
+            import pandas as pd
+            df = pd.read_excel(XLSX, header=2, engine='openpyxl')
+            for _, row in df.iterrows():
+                if pd.isna(row.get('院校名称')): continue
+                min_s = int(row['最低分1']) if '最低分1' in row and pd.notna(row['最低分1']) else None
+                avg_s = int(row['平均分']) if '平均分' in row and pd.notna(row['平均分']) else min_s
+                rec = AdmissionRecord(
+                    year=str(row.get('年份', '2025')),
+                    batch=row.get('批次', ''),
+                    category=row.get('科类', ''),
+                    requirement=row.get('选科要求', ''),
+                    college_name=row['院校名称'],
+                    college_code=str(row.get('院校代码', '')),
+                    college_info=str(row.get('院校基础信息', '')),
+                    major_name=row.get('专业名称', ''),
+                    major_code=str(row.get('专业代码', '')),
+                    major_info=str(row.get('专业基础信息', '')),
+                    min_score=min_s,
+                    min_rank=int(row['最低位次']) if '最低位次' in row and pd.notna(row['最低位次']) else None,
+                    avg_score=avg_s,
+                    max_score=int(row['最高分']) if '最高分' in row and pd.notna(row['最高分']) else None,
+                    tuition=str(row.get('学费', '')),
+                    city=str(row.get('城市', ''))
+                )
+                db.session.add(rec)
+            db.session.commit()
+    return app
 
-# ==================== HTML模板函数 ====================
-def html(content):
-    """生成完整HTML页面"""
-    return f'''
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>福建高考志愿填报系统</title>
-        <style>
-            body {{ font-family: Arial, sans-serif; margin: 20px; background-color: #f5f5f5; }}
-            .container {{ max-width: 1200px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }}
-            .header {{ background: #4CAF50; color: white; padding: 15px; border-radius: 5px; margin-bottom: 20px; }}
-            .nav {{ margin: 10px 0; }}
-            .btn {{ display: inline-block; padding: 8px 15px; margin: 5px; background: #2196F3; color: white; text-decoration: none; border-radius: 5px; }}
-            .btn:hover {{ background: #0b7dda; }}
-            .form-group {{ margin: 15px 0; }}
-            label {{ display: block; margin-bottom: 5px; font-weight: bold; }}
-            input, select {{ width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px; }}
-            .results {{ margin-top: 20px; }}
-            table {{ width: 100%; border-collapse: collapse; margin-top: 10px; }}
-            th, td {{ border: 1px solid #ddd; padding: 10px; text-align: left; }}
-            th {{ background-color: #f2f2f2; }}
-            .error {{ color: red; padding: 10px; background: #ffe6e6; border-radius: 5px; }}
-            .success {{ color: green; padding: 10px; background: #e6ffe6; border-radius: 5px; }}
-            .guide-container {{ line-height: 1.6; }}
-            .guide-container h2 {{ color: #2196F3; border-bottom: 2px solid #2196F3; padding-bottom: 5px; }}
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <div class="header">
-                <h1>🎓 福建高考志愿填报系统</h1>
-                <div class="nav">
-                    <a href="/" class="btn">🏠 首页</a>
-                    <a href="/user/dashboard" class="btn">🔍 专业查询</a>
-                    <a href="/guide" class="btn">📖 填报指南</a>
-                    <a href="/admin" class="btn">⚙️ 管理后台</a>
-                </div>
-            </div>
-            {content}
-        </div>
-    </body>
-    </html>
-    '''
+create_app()
 
-# ==================== 路由定义 ====================
+# ==================== 6. 路由 =================================================
+from flask import render_template_string as _r
+
+def bs_html(content):
+    """套 Bootstrap5 外壳"""
+    return _r('''
+<!doctype html><html lang="zh">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>福建高考志愿系统</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body class="bg-light">
+<nav class="navbar navbar-dark bg-primary">
+  <div class="container-fluid">
+    <a class="navbar-brand" href="/">福建高考志愿系统</a>
+    <div>
+      {% if session.username %}
+        <span class="text-white me-3">{{ session.username }} ({{ session.role }})</span>
+        <a class="btn btn-sm btn-outline-light" href="/logout">退出</a>
+      {% else %}
+        <a class="btn btn-sm btn-outline-light" href="/login">登录</a>
+      {% endif %}
+    </div>
+  </div>
+</nav>
+<div class="container mt-4">''' + content + '''</div>
+</body></html>''', session=session)
+
 @app.route('/')
 def index():
-    """首页"""
-    return html('''
-        <h2>欢迎使用福建高考志愿填报系统</h2>
-        <p>本系统提供福建省2025年高考招生数据查询服务</p>
-        <div style="margin: 20px 0;">
-            <a href="/user/login" class="btn">👤 用户登录</a>
-            <a href="/admin/login" class="btn">🔑 管理员登录</a>
-            <a href="/user/dashboard" class="btn">🔍 直接查询（无需登录）</a>
-        </div>
-        <div class="success">
-            <h3>📊 数据统计</h3>
-            <p>• 包含福建省多所高校招生数据</p>
-            <p>• 支持按院校、专业、分数等多维度查询</p>
-            <p>• 提供详细的院校和专业信息</p>
-        </div>
-    ''')
+    return bs_html('''
+<h2>欢迎使用福建高考志愿填报系统</h2>
+<div class="d-grid gap-2 d-md-flex">
+  <a class="btn btn-primary me-2" href="/register">用户注册</a>
+  <a class="btn btn-success me-2" href="/login">学生/家长登录</a>
+  <a class="btn btn-warning me-2" href="/admin/login">管理员登录</a>
+  <a class="btn btn-info" href="/query">直接查询</a>
+</div>''')
 
-@app.route('/user/login', methods=['GET', 'POST'])
-def user_login():
-    """用户登录"""
+# ---------- 注册 ----------
+@app.route('/register', methods=['GET', 'POST'])
+def register():
     if request.method == 'POST':
-        username = request.form.get('username')
-        password = request.form.get('password')
-        
-        # 简单验证（实际应用中应使用加密和数据库验证）
-        if username and password:
-            session['username'] = username
-            session['role'] = 'user'
-            return redirect('/user/dashboard')
-        else:
-            return html('<div class="error">请输入用户名和密码</div>')
-    
-    return html('''
-        <h2>用户登录</h2>
-        <form method="POST">
-            <div class="form-group">
-                <label>用户名：</label>
-                <input type="text" name="username" required>
-            </div>
-            <div class="form-group">
-                <label>密码：</label>
-                <input type="password" name="password" required>
-            </div>
-            <button type="submit" class="btn">登录</button>
-            <a href="/user/dashboard" class="btn">跳过登录直接查询</a>
-        </form>
-    ''')
+        u, p = request.form['username'], request.form['password']
+        if User.query.filter_by(username=u).first():
+            return bs_html('<div class="alert alert-danger">用户名已存在</div>')
+        db.session.add(User(username=u, password=hash_pwd(p), role='user'))
+        db.session.commit()
+        return bs_html('<div class="alert alert-success">注册成功，<a href="/login">去登录</a></div>')
+    return bs_html('''
+<h4>用户注册</h4>
+<form method="post">
+  <div class="mb-3"><label>用户名</label><input class="form-control" name="username" required></div>
+  <div class="mb-3"><label>密码</label><input type="password" class="form-control" name="password" required></div>
+  <button class="btn btn-primary">注册</button>
+</form>''')
 
-@app.route('/user/dashboard', methods=['GET', 'POST'])
-def user_dashboard():
-    """用户查询界面"""
-    results = []
-    query_executed = False
-    
+# ---------- 登录 ----------
+@app.route('/login', methods=['GET', 'POST'])
+def login():
     if request.method == 'POST':
-        college_name = request.form.get('college_name', '').strip()
-        major_name = request.form.get('major_name', '').strip()
-        min_score = request.form.get('min_score', '').strip()
-        
-        # 构建查询
-        query = AdmissionRecord.query
-        
-        if college_name:
-            query = query.filter(AdmissionRecord.college_name.like(f'%{college_name}%'))
-        if major_name:
-            query = query.filter(AdmissionRecord.major_name.like(f'%{major_name}%'))
-        if min_score:
-            try:
-                score = int(min_score)
-                query = query.filter(AdmissionRecord.min_score >= score)
-            except:
-                pass
-        
-        results = query.limit(100).all()
-        query_executed = True
-    
-    # 构建结果表格
-    results_html = ''
-    if results:
-        results_html = '<h3>查询结果：</h3><table>'
-        results_html += '''
-            <tr>
-                <th>院校名称</th>
-                <th>专业名称</th>
-                <th>最低分</th>
-                <th>批次</th>
-                <th>科类</th>
-                <th>学费</th>
-                <th>城市</th>
-                <th>操作</th>
-            </tr>
-        '''
-        for record in results:
-            results_html += f'''
-                <tr>
-                    <td>{record.college_name}</td>
-                    <td>{record.major_name}</td>
-                    <td>{record.min_score if record.min_score else 'N/A'}</td>
-                    <td>{record.batch}</td>
-                    <td>{record.category}</td>
-                    <td>{record.tuition}</td>
-                    <td>{record.city}</td>
-                    <td><a href="/detail/{record.id}" class="btn">详情</a></td>
-                </tr>
-            '''
-        results_html += '</table>'
-    elif query_executed:
-        results_html = '<div class="error">未找到匹配的记录</div>'
-    
-    return html(f'''
-        <h2>🔍 专业查询</h2>
-        <form method="POST">
-            <div class="form-group">
-                <label>院校名称：</label>
-                <input type="text" name="college_name" placeholder="输入院校名称（如：厦门大学）">
-            </div>
-            <div class="form-group">
-                <label>专业名称：</label>
-                <input type="text" name="major_name" placeholder="输入专业名称（如：经济学类）">
-            </div>
-            <div class="form-group">
-                <label>最低分数：</label>
-                <input type="number" name="min_score" placeholder="输入最低分数（如：600）">
-            </div>
-            <button type="submit" class="btn">查询</button>
-            <a href="/" class="btn">返回首页</a>
-        </form>
-        {results_html}
-    ''')
+        u, p = request.form['username'], request.form['password']
+        user = User.query.filter_by(username=u).first()
+        if user and check_pwd(p, user.password):
+            session['username'] = u
+            session['role'] = user.role
+            return redirect('/query')
+        return bs_html('<div class="alert alert-danger">账号或密码错误</div>')
+    return bs_html('''
+<h4>登录</h4>
+<form method="post">
+  <div class="mb-3"><label>用户名</label><input class="form-control" name="username" required></div>
+  <div class="mb-3"><label>密码</label><input type="password" class="form-control" name="password" required></div>
+  <button class="btn btn-primary">登录</button>
+</form>''')
 
-@app.route('/detail/<int:record_id>')
-def detail(record_id):
-    """查看详情"""
-    record = AdmissionRecord.query.get(record_id)
-    if not record:
-        return html('<div class="error">记录不存在</div>')
-    
-    return html(f'''
-        <h2>📋 详细信息</h2>
-        <div style="background: #f9f9f9; padding: 15px; border-radius: 5px;">
-            <h3>{record.college_name} - {record.major_name}</h3>
-            <p><strong>年份：</strong>{record.year}</p>
-            <p><strong>批次：</strong>{record.batch}</p>
-            <p><strong>科类：</strong>{record.category}</p>
-            <p><strong>院校代码：</strong>{record.college_code}</p>
-            <p><strong>专业代码：</strong>{record.major_code}</p>
-            <p><strong>最低分：</strong>{record.min_score if record.min_score else 'N/A'}</p>
-            <p><strong>学费：</strong>{record.tuition}</p>
-            <p><strong>城市：</strong>{record.city}</p>
-            <p><strong>院校信息：</strong>{record.college_info}</p>
-            <p><strong>专业信息：</strong>{record.major_info}</p>
-        </div>
-        <div style="margin-top: 20px;">
-            <a href="/user/dashboard" class="btn">返回查询</a>
-            <a href="/" class="btn">返回首页</a>
-        </div>
-    ''')
-
-@app.route('/guide')
-def guide():
-    """填报指南"""
-    try:
-        content = ""
-        if os.path.exists(txt_guide_path):
-            with open(txt_guide_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-        else:
-            content = "⚠️ 未找到填报指南文件"
-        
-        # 简单格式化
-        lines = content.split('\n')
-        formatted_lines = []
-        for line in lines:
-            line = line.strip()
-            if line.startswith('**') and line.endswith('**'):
-                formatted_lines.append(f"<h2>{line[2:-2]}</h2>")
-            elif line:
-                formatted_lines.append(f"<p>{line}</p>")
-            else:
-                formatted_lines.append("<br>")
-        
-        return html(f'''
-            <div class="header-nav">
-                <h2>📖 志愿填报指南</h2>
-                <a href="/user/dashboard" class="btn">返回查询</a>
-            </div>
-            <div class="guide-container">{''.join(formatted_lines)}</div>
-        ''')
-    except Exception as e:
-        return html(f"<h3>读取指南出错</h3><p>{e}</p>")
-
-@app.route('/admin/login', methods=['GET', 'POST'])
-def admin_login():
-    """管理员登录"""
-    if request.method == 'POST':
-        username = request.form.get('username')
-        password = request.form.get('password')
-        
-        # 简单管理员验证（实际应用中应更安全）
-        if username == 'admin' and password == 'admin123':
-            session['username'] = username
-            session['role'] = 'admin'
-            return redirect('/admin')
-        else:
-            return html('<div class="error">管理员账号或密码错误</div>')
-    
-    return html('''
-        <h2>管理员登录</h2>
-        <form method="POST">
-            <div class="form-group">
-                <label>管理员账号：</label>
-                <input type="text" name="username" required>
-            </div>
-            <div class="form-group">
-                <label>密码：</label>
-                <input type="password" name="password" required>
-            </div>
-            <button type="submit" class="btn">登录</button>
-            <a href="/" class="btn">返回首页</a>
-        </form>
-    ''')
-
-@app.route('/admin')
-def admin_panel():
-    """管理后台"""
-    if session.get('role') != 'admin':
-        return redirect('/admin/login')
-    
-    # 统计数据
-    total_records = AdmissionRecord.query.count()
-    total_users = User.query.count()
-    
-    return html(f'''
-        <h2>⚙️ 管理后台</h2>
-        <div style="display: flex; gap: 20px; margin: 20px 0;">
-            <div style="flex: 1; background: #e3f2fd; padding: 15px; border-radius: 5px;">
-                <h3>📊 数据统计</h3>
-                <p>招生记录数：{total_records}</p>
-                <p>注册用户数：{total_users}</p>
-            </div>
-            <div style="flex: 1; background: #f3e5f5; padding: 15px; border-radius: 5px;">
-                <h3>🛠️ 管理功能</h3>
-                <a href="/admin/import" class="btn">📥 导入数据</a>
-                <a href="/admin/users" class="btn">👥 用户管理</a>
-                <a href="/admin/logout" class="btn">🚪 退出登录</a>
-            </div>
-        </div>
-    ''')
-
-@app.route('/admin/import')
-def admin_import():
-    """数据导入页面"""
-    if session.get('role') != 'admin':
-        return redirect('/admin/login')
-    
-    return html('''
-        <h2>📥 数据导入</h2>
-        <p>点击下方按钮开始导入Excel数据：</p>
-        <form action="/admin/do_import" method="POST">
-            <button type="submit" class="btn" onclick="return confirm('确定要导入数据吗？这会覆盖现有数据。')">
-                开始导入数据
-            </button>
-        </form>
-        <div style="margin-top: 20px;">
-            <a href="/admin" class="btn">返回管理后台</a>
-        </div>
-    ''')
-
-@app.route('/admin/do_import', methods=['POST'])
-def admin_do_import():
-    """执行数据导入"""
-    if session.get('role') != 'admin':
-        return redirect('/admin/login')
-    
-    count = auto_import_data()
-    
-    if count > 0:
-        message = f'<div class="success">✅ 成功导入 {count} 条记录</div>'
-    else:
-        message = '<div class="error">❌ 数据导入失败，请检查Excel文件路径</div>'
-    
-    return html(f'''
-        <h2>📥 数据导入结果</h2>
-        {message}
-        <div style="margin-top: 20px;">
-            <a href="/admin" class="btn">返回管理后台</a>
-            <a href="/admin/import" class="btn">重新导入</a>
-        </div>
-    ''')
-
-@app.route('/admin/logout')
-def admin_logout():
-    """管理员退出登录"""
+@app.route('/logout')
+def logout():
     session.clear()
     return redirect('/')
 
-# ==================== 初始化数据 ====================
-def init_database():
-    """初始化数据库和默认用户"""
-    with app.app_context():
-        # 创建所有表
-        db.create_all()
-        
-        # 创建默认管理员用户（如果不存在）
-        admin_user = User.query.filter_by(username='admin').first()
-        if not admin_user:
-            admin_user = User(username='admin', password='admin123', role='admin')
-            db.session.add(admin_user)
-            db.session.commit()
-            print("✅ 创建默认管理员账号：admin / admin123")
-        
-        # 创建默认普通用户（如果不存在）
-        user = User.query.filter_by(username='user').first()
-        if not user:
-            user = User(username='user', password='user123', role='user')
-            db.session.add(user)
-            db.session.commit()
-            print("✅ 创建默认用户账号：user / user123")
-        
-        print("✅ 数据库初始化完成")
+# ---------- 查询 ----------
+@app.route('/query', methods=['GET', 'POST'])
+def query():
+    if request.method == 'POST':
+        user_score = int(request.form.get('score', 0))
+        college    = request.form.get('college', '').strip()
+        category   = request.form.get('category', '').strip()
+        q = AdmissionRecord.query
+        if college:   q = q.filter(AdmissionRecord.college_name.contains(college))
+        if category:  q = q.filter(AdmissionRecord.category == category)
+        records = q.all()
+        # 计算概率并缓存
+        for r in records:
+            r.probability = calc_probability(user_score, r.min_score, r.avg_score or r.min_score)
+        db.session.commit()
+        return bs_html(f'''
+<h4>查询结果</h4>
+<a class="btn btn-success mb-3" href="/analysis?score={user_score}&college={college}&category={category}">查看智能分析报告</a>
+<table class="table table-bordered table-sm">
+  <thead class="table-light"><tr>
+    <th>院校</th><th>专业</th><th>科类</th><th>最低分</th><th>平均分</th><th>录取概率</th>
+  </tr></thead>
+  <tbody>''' + '\n'.join(f'''
+    <tr>
+      <td>{r.college_name}</td><td>{r.major_name}</td><td>{r.category}</td>
+      <td>{r.min_score or ''}</td><td>{r.avg_score or ''}</td>
+      <td><span class="badge {"bg-success" if r.probability>80 else "bg-warning" if r.probability>40 else "bg-danger"}">{r.probability}%</span></td>
+    </tr>''' for r in records) + '''
+  </tbody></table>''')
 
-# ==================== 主程序 ====================
+    return bs_html('''
+<h4>志愿查询</h4>
+<form method="post">
+  <div class="row g-3">
+    <div class="col-md-3"><label>高考分数</label><input type="number" class="form-control" name="score" required></div>
+    <div class="col-md-3"><label>院校名称</label><input class="form-control" name="college" placeholder="可选"></div>
+    <div class="col-md-3"><label>科类</label>
+      <select class="form-select" name="category"><option value="">全部</option><option>物理类</option><option>历史类</option></select></div>
+    <div class="col-md-3 align-self-end"><button class="btn btn-primary">查询</button></div>
+  </div>
+</form>''')
+
+# ---------- 智能分析报告 ----------
+@app.route('/analysis')
+def analysis():
+    score   = int(request.args.get('score', 0))
+    college = request.args.get('college', '')
+    category= request.args.get('category', '')
+    q = AdmissionRecord.query
+    if college:  q = q.filter(AdmissionRecord.college_name.contains(college))
+    if category: q = q.filter(AdmissionRecord.category == category)
+    records = q.all()
+    # 概率区间 ±25
+    data = []
+    for r in records:
+        p = calc_probability(score, r.min_score, r.avg_score or r.min_score)
+        if (score - 25) <= (r.avg_score or r.min_score or 0) <= (score + 25):
+            data.append({'school': r.college_name, 'prob': p})
+    data = sorted(data, key=lambda x: x['prob'], reverse=True)[:30]
+    chart_data = {
+        'labels': [d['school'] for d in data],
+        'datasets': [{
+            'label': '录取概率',
+            'data': [d['prob'] for d in data],
+            'backgroundColor': ['#28a745' if v > 80 else '#ffc107' if v > 40 else '#dc3545' for v in [d['prob'] for d in data]]
+        }]
+    }
+    return bs_html(f'''
+<h4>智能分析报告</h4>
+<p>您的分数：<strong>{score}</strong> 分</p>
+<p>分析范围：分数±25 分内的院校</p>
+<canvas id="probChart" height="100"></canvas>
+<script>
+var ctx = document.getElementById('probChart').getContext('2d');
+new Chart(ctx, {{type: 'bar', data: {chart_data},
+  options: {{ indexAxis: 'y', plugins: {{tooltip: {{ callbacks: {{ label: function(ctx) {{ return '概率: ' + ctx.parsed.x + '%' }} }} }} }} }}
+}});
+</script>
+<a class="btn btn-secondary" href="/query">返回查询</a>''')
+
+# ---------- 填报指南 ----------
+@app.route('/guide')
+def guide():
+    if not os.path.exists(TXT):
+        return bs_html('<div class="alert alert-warning">暂无填报指南</div>')
+    with open(TXT, encoding='utf-8') as f:
+        txt = f.read().replace('\n', '<br>')
+    return bs_html(f'<h4>填报指南</h4><div class="border p-3">{txt}</div><a class="btn btn-secondary mt-3" href="/query">返回</a>')
+
+# ---------- 管理员后台 ----------
+@app.route('/admin/login', methods=['GET', 'POST'])
+def admin_login():
+    if request.method == 'POST':
+        u, p = request.form['username'], request.form['password']
+        user = User.query.filter_by(username=u, role='admin').first()
+        if user and check_pwd(p, user.password):
+            session['username'] = u
+            session['role'] = 'admin'
+            return redirect('/admin/dashboard')
+        return bs_html('<div class="alert alert-danger">管理员账号或密码错误</div>')
+    return bs_html('''
+<h4>管理员登录</h4>
+<form method="post">
+  <div class="mb-3"><label>账号</label><input class="form-control" name="username" required></div>
+  <div class="mb-3"><label>密码</label><input type="password" class="form-control" name="password" required></div>
+  <button class="btn btn-primary">登录</button>
+</form>''')
+
+@app.route('/admin/dashboard')
+def admin_dashboard():
+    if session.get('role') != 'admin':
+        return redirect('/admin/login')
+    return bs_html(f'''
+<h4>管理后台</h4>
+<div class="row">
+  <div class="col-md-4">
+    <div class="card">
+      <div class="card-body">
+        <h5 class="card-title">用户管理</h5>
+        <p class="card-text">共 {User.query.count()} 个账号</p>
+        <a href="/admin/users" class="btn btn-primary">进入</a>
+      </div>
+    </div>
+  </div>
+  <div class="col-md-4">
+    <div class="card">
+      <div class="card-body">
+        <h5 class="card-title">录取数据管理</h5>
+        <p class="card-text">共 {AdmissionRecord.query.count()} 条记录</p>
+        <a href="/admin/data" class="btn btn-primary">进入</a>
+      </div>
+    </div>
+  </div>
+</div>''')
+
+# ---------- 用户管理 ----------
+@app.route('/admin/users')
+def admin_users():
+    if session.get('role') != 'admin':
+        return redirect('/admin/login')
+    users = User.query.all()
+    return bs_html(f'''
+<h4>用户列表</h4>
+<a class="btn btn-success mb-3" href="/admin/user/add">+ 添加新用户</a>
+<table class="table table-bordered table-sm">
+  <thead class="table-light"><tr><th>ID</th><th>用户名</th><th>角色</th><th>操作</th></tr></thead>
+  <tbody>''' + '\n'.join(f'''
+    <tr>
+      <td>{u.id}</td><td>{u.username}</td><td>{u.role}</td>
+      <td>
+        <a class="btn btn-sm btn-warning" href="/admin/user/edit/{u.id}">编辑</a>
+        <a class="btn btn-sm btn-danger" href="/admin/user/del/{u.id}" onclick="return confirm('确定删除吗？')">删除</a>
+      </td>
+    </tr>''' for u in users) + '''
+</tbody></table>''')
+
+@app.route('/admin/user/add', methods=['GET', 'POST'])
+def admin_user_add():
+    if session.get('role') != 'admin':
+        return redirect('/admin/login')
+    if request.method == 'POST':
+        u, p, r = request.form['username'], request.form['password'], request.form['role']
+        if User.query.filter_by(username=u).first():
+            return bs_html('<div class="alert alert-danger">用户名已存在</div>')
+        db.session.add(User(username=u, password=hash_pwd(p), role=r))
+        db.session.commit()
+        return redirect('/admin/users')
+    return bs_html('''
+<h4>添加用户</h4>
+<form method="post">
+  <div class="mb-3"><label>用户名</label><input class="form-control" name="username" required></div>
+  <div class="mb-3"><label>密码</label><input type="password" class="form-control" name="password" required></div>
+  <div class="mb-3"><label>角色</label>
+    <select class="form-select" name="role"><option value="user">学生/家长</option><option value="admin">管理员</option></select></div>
+  <button class="btn btn-primary">创建</button>
+</form>''')
+
+@app.route('/admin/user/edit/<int:uid>', methods=['GET', 'POST'])
+def admin_user_edit(uid):
+    if session.get('role') != 'admin':
+        return redirect('/admin/login')
+    user = User.query.get_or_404(uid)
+    if request.method == 'POST':
+        user.password = hash_pwd(request.form['password'])
+        user.role     = request.form['role']
+        db.session.commit()
+        return redirect('/admin/users')
+    return bs_html(f'''
+<h4>编辑用户</h4>
+<form method="post">
+  <div class="mb-3"><label>新密码</label><input type="password" class="form-control" name="password" required></div>
+  <div class="mb-3"><label>角色</label>
+    <select class="form-select" name="role"><option value="user" {"selected" if user.role=="user" else ""}>学生/家长</option><option value="admin" {"selected" if user.role=="admin" else ""}>管理员</option></select></div>
+  <button class="btn btn-primary">保存</button>
+</form>''')
+
+@app.route('/admin/user/del/<int:uid>')
+def admin_user_del(uid):
+    if session.get('role') != 'admin':
+        return redirect('/admin/login')
+    User.query.filter_by(id=uid).delete()
+    db.session.commit()
+    return redirect('/admin/users')
+
+# ---------- 录取数据管理 ----------
+@app.route('/admin/data')
+def admin_data():
+    if session.get('role') != 'admin':
+        return redirect('/admin/login')
+    keyword = request.args.get('search', '')
+    q = AdmissionRecord.query
+    if keyword:
+        q = q.filter(AdmissionRecord.college_name.contains(keyword))
+    records = q.paginate(per_page=20, error_out=False)
+    return bs_html(f'''
+<h4>录取数据管理</h4>
+<form class="row g-2 mb-3">
+  <div class="col-auto"><input class="form-control" name="search" placeholder="院校名称" value="{keyword}"></div>
+  <div class="col-auto"><button class="btn btn-primary">搜索</button></div>
+</form>
+<a class="btn btn-success mb-3" href="/admin/data/add">+ 新增数据</a>
+<table class="table table-bordered table-sm">
+  <thead class="table-light"><tr>
+    <th>ID</th><th>院校</th><th>专业</th><th>科类</th><th>最低分</th><th>操作</th>
+  </tr></thead>
+  <tbody>''' + '\n'.join(f'''
+    <tr>
+      <td>{r.id}</td><td>{r.college_name}</td><td>{r.major_name}</td><td>{r.category}</td><td>{r.min_score or ""}</td>
+      <td>
+        <a class="btn btn-sm btn-warning" href="/admin/data/edit/{r.id}">编辑</a>
+        <a class="btn btn-sm btn-danger" href="/admin/data/del/{r.id}" onclick="return confirm('确定删除吗？')">删除</a>
+      </td>
+    </tr>''' for r in records.items) + f'''
+</tbody></table>
+<nav><ul class="pagination">
+  <li class="page-item {"disabled" if not records.has_prev else ""}"><a class="page-link" href="{url_for("admin_data", search=keyword, page=records.prev_num) if records.has_prev else "#"}">上一页</a></li>
+  <li class="page-item {"disabled" if not records.has_next else ""}"><a class="page-link" href="{url_for("admin_data", search=keyword, page=records.next_num) if records.has_next else "#"}">下一页</a></li>
+</ul></nav>''')
+
+@app.route('/admin/data/add', methods=['GET', 'POST'])
+def admin_data_add():
+    if session.get('role') != 'admin':
+        return redirect('/admin/login')
+    if request.method == 'POST':
+        f = request.form
+        r = AdmissionRecord(
+            year=f['year'], batch=f['batch'], category=f['category'], requirement=f['requirement'],
+            college_name=f['college_name'], college_code=f['college_code'], college_info=f['college_info'],
+            major_name=f['major_name'], major_code=f['major_code'], major_info=f['major_info'],
+            min_score=int(f['min_score']) if f['min_score'] else None,
+            min_rank=int(f['min_rank']) if f['min_rank'] else None,
+            avg_score=int(f['avg_score']) if f['avg_score'] else None,
+            max_score=int(f['max_score']) if f['max_score'] else None,
+            tuition=f['tuition'], city=f['city']
+        )
+        db.session.add(r)
+        db.session.commit()
+        return redirect('/admin/data')
+    return bs_html('''
+<h4>新增录取数据</h4>
+<form method="post">
+  <div class="row g-2">
+    <div class="col-md-2"><label>年份</label><input class="form-control" name="year" value="2025"></div>
+    <div class="col-md-2"><label>批次</label><input class="form-control" name="batch"></div>
+    <div class="col-md-2"><label>科类</label><input class="form-control" name="category"></div>
+    <div class="col-md-2"><label>选科要求</label><input class="form-control" name="requirement"></div>
+    <div class="col-md-4"><label>院校名称</label><input class="form-control" name="college_name" required></div>
+    <div class="col-md-2"><label>院校代码</label><input class="form-control" name="college_code"></div>
+    <div class="col-md-4"><label>专业名称</label><input class="form-control" name="major_name" required></div>
+    <div class="col-md-2"><label>专业代码</label><input class="form-control" name="major_code"></div>
+    <div class="col-md-6"><label>院校信息</label><textarea class="form-control" name="college_info"></textarea></div>
+    <div class="col-md-6"><label>专业信息</label><textarea class="form-control" name="major_info"></textarea></div>
+    <div class="col-md-2"><label>最低分</label><input type="number" class="form-control" name="min_score"></div>
+    <div class="col-md-2"><label>最低位次</label><input type="number" class="form-control" name="min_rank"></div>
+    <div class="col-md-2"><label>平均分</label><input type="number" class="form-control" name="avg_score"></div>
+    <div class="col-md-2"><label>最高分</label><input type="number" class="form-control" name="max_score"></div>
+    <div class="col-md-2"><label>学费</label><input class="form-control" name="tuition"></div>
+    <div class="col-md-2"><label>城市</label><input class="form-control" name="city"></div>
+  </div>
+  <button class="btn btn-primary mt-3">提交</button>
+</form>''')
+
+@app.route('/admin/data/edit/<int:rid>', methods=['GET', 'POST'])
+def admin_data_edit(rid):
+    if session.get('role') != 'admin':
+        return redirect('/admin/login')
+    r = AdmissionRecord.query.get_or_404(rid)
+    if request.method == 'POST':
+        f = request.form
+        r.year        = f['year']; r.batch     = f['batch']; r.category  = f['category']; r.requirement = f['requirement']
+        r.college_name= f['college_name']; r.college_code = f['college_code']; r.college_info = f['college_info']
+        r.major_name  = f['major_name']; r.major_code   = f['major_code'];   r.major_info   = f['major_info']
+        r.min_score   = int(f['min_score']) if f['min_score'] else None
+        r.min_rank    = int(f['min_rank'])  if f['min_rank']  else None
+        r.avg_score   = int(f['avg_score']) if f['avg_score'] else None
+        r.max_score   = int(f['max_score']) if f['max_score'] else None
+        r.tuition     = f['tuition']; r.city = f['city']
+        db.session.commit()
+        return redirect('/admin/data')
+    return bs_html(f'''
+<h4>编辑数据</h4>
+<form method="post">
+  <div class="row g-2">
+    <div class="col-md-2"><label>年份</label><input class="form-control" name="year" value="{r.year}"></div>
+    <div class="col-md-2"><label>批次</label><input class="form-control" name="batch" value="{r.batch}"></div>
+    <div class="col-md-2"><label>科类</label><input class="form-control" name="category" value="{r.category}"></div>
+    <div class="col-md-2"><label>选科要求</label><input class="form-control" name="requirement" value="{r.requirement or ''}"></div>
+    <div class="col-md-4"><label>院校名称</label><input class="form-control" name="college_name" value="{r.college_name}" required></div>
+    <div class="col-md-2"><label>院校代码</label><input class="form-control" name="college_code" value="{r.college_code or ''}"></div>
+    <div class="col-md-4"><label>专业名称</label><input class="form-control" name="major_name" value="{r.major_name}" required></div>
+    <div class="col-md-2"><label>专业代码</label><input class="form-control" name="major_code" value="{r.major_code or ''}"></div>
+    <div class="col-md-6"><label>院校信息</label><textarea class="form-control" name="college_info">{r.college_info or ''}</textarea></div>
+    <div class="col-md-6"><label>专业信息</label><textarea class="form-control" name="major_info">{r.major_info or ''}</textarea></div>
+    <div class="col-md-2"><label>最低分</label><input type="number" class="form-control" name="min_score" value="{r.min_score or ''}"></div>
+    <div class="col-md-2"><label>最低位次</label><input type="number" class="form-control" name="min_rank" value="{r.min_rank or ''}"></div>
+    <div class="col-md-2"><label>平均分</label><input type="number" class="form-control" name="avg_score" value="{r.avg_score or ''}"></div>
+    <div class="col-md-2"><label>最高分</label><input type="number" class="form-control" name="max_score" value="{r.max_score or ''}"></div>
+    <div class="col-md-2"><label>学费</label><input class="form-control" name="tuition" value="{r.tuition or ''}"></div>
+    <div class="col-md-2"><label>城市</label><input class="form-control" name="city" value="{r.city or ''}"></div>
+  </div>
+  <button class="btn btn-primary mt-3">保存</button>
+</form>''')
+
+@app.route('/admin/data/del/<int:rid>')
+def admin_data_del(rid):
+    if session.get('role') != 'admin':
+        return redirect('/admin/login')
+    AdmissionRecord.query.filter_by(id=rid).delete()
+    db.session.commit()
+    return redirect('/admin/data')
+
+# ==================== 7. 启动（仅本地） ====================
 if __name__ == '__main__':
-    # 初始化数据库
-    init_database()
-    
-    # 检查并导入数据（如果数据库为空）
-    with app.app_context():
-        count = AdmissionRecord.query.count()
-        if count == 0:
-            print("📊 数据库为空，开始自动导入数据...")
-            auto_import_data()
-        else:
-            print(f"📊 数据库已有 {count} 条记录")
-    
-    # 启动Flask应用
-    port = int(os.environ.get("PORT", 5000))
-    print(f"🚀 服务器启动在 http://localhost: {port}")
-    print(f"📁 数据文件路径：{xlsx_source_path}")
-    app.run(host='0.0.0.0', port=port, debug=True)
-
-
+    port = int(os.getenv('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
